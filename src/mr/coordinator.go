@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// Enum status for tasks
+// Task status state
 type TaskStatus int
 
 const (
@@ -19,9 +19,18 @@ const (
 	COMPLETED
 )
 
+// Type of job currently being performed
+type JobType int
+
+const (
+	MAP JobType = iota
+	REDUCE
+)
+
+// A task has a status state and initiated time to track whether it needs to be reassigned after 10 seconds
 type Task struct {
-	status  TaskStatus
-	started time.Time
+	Status  TaskStatus
+	Started time.Time
 }
 
 type Coordinator struct {
@@ -31,7 +40,108 @@ type Coordinator struct {
 	mu          sync.Mutex
 }
 
-// Your code here -- RPC handlers for the worker to call.
+//////////////////////////////////////////////////////////
+// Your code here -- RPC handlers for the worker to call./
+//////////////////////////////////////////////////////////
+
+// Getting a task (MAP or REDUCE) doesn't require an arg,
+type GetTaskArg struct{}
+
+type GetTaskReply struct {
+	Job         JobType // MAP || REDUCE
+	FileName    string  // File the worker will be assigned
+	WaitForTask bool    // Flag indicating whether there are still Map jobs left to complete.
+	Index       int     // Index number of the current task
+	MapCount    int     // Number of total Map tasks
+	ReduceCount int     // Number of total Reduce tasks
+}
+
+// Completing a task
+type TaskCompleteArg struct {
+	Index int
+	Job   JobType
+}
+
+type TaskCompleteReply struct{}
+
+// General task handler for Map and Reduce tasks
+func (c *Coordinator) GetTask(args *GetTaskArg, reply *GetTaskReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Map-phase
+	if i, task := c.findAvailableTask(c.MapTasks); i >= 0 {
+		c.assignTask(i, task, reply, MAP)
+		return nil
+	}
+
+	if !c.allTasksComplete(c.MapTasks) {
+		reply.WaitForTask = true
+		return nil
+	}
+
+	// Reduce-phase
+	if i, task := c.findAvailableTask(c.ReduceTasks); i >= 0 {
+		c.assignTask(i, task, reply, REDUCE)
+		return nil
+	}
+
+	// All reduce tasks completed means the whole MR job is done
+	if c.allTasksComplete(c.ReduceTasks) {
+		return nil
+	}
+
+	reply.WaitForTask = true
+	return nil
+}
+
+// General function to mark tasks complete
+func (c *Coordinator) MarkTaskComplete(args *TaskCompleteArg, reply *TaskCompleteReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if args.Job == MAP {
+		c.MapTasks[args.Index].Status = COMPLETED
+		return nil
+	}
+	c.ReduceTasks[args.Index].Status = COMPLETED
+	return nil
+}
+
+// General function to find the first task indicated as UNASSIGNED
+func (c *Coordinator) findAvailableTask(tasks []Task) (index int, task *Task) {
+	for i := range tasks {
+		if tasks[i].Status == UNASSIGNED {
+			return i, &tasks[i]
+		}
+	}
+	return -1, nil
+}
+
+// General function to assign the current task struct
+func (c *Coordinator) assignTask(index int, task *Task, reply *GetTaskReply, jobType JobType) {
+	task.Started = time.Now()
+	task.Status = ASSIGNED
+	reply.Index = index
+	reply.Job = jobType
+	reply.MapCount = len(c.MapTasks)
+	reply.ReduceCount = len(c.ReduceTasks)
+	reply.WaitForTask = false
+
+	if jobType == MAP {
+		reply.FileName = c.Files[index]
+	}
+}
+
+// General function to determine if all tasks in a phase are complete
+func (c *Coordinator) allTasksComplete(tasks []Task) bool {
+	for _, task := range tasks {
+		if task.Status != COMPLETED {
+			return false
+		}
+	}
+	return true
+}
 
 // start a thread that listens for RPCs from worker.go
 func (c *Coordinator) server() {
@@ -61,9 +171,11 @@ func (c *Coordinator) Done() bool {
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{}
-
-	// Your code here.
+	c := Coordinator{
+		Files:       files,
+		MapTasks:    make([]Task, len(files)),
+		ReduceTasks: make([]Task, nReduce),
+	}
 
 	c.server()
 	return &c
