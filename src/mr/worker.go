@@ -41,7 +41,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		if task.Job == MAP {
 			mapTaskHandler(mapf, task)
 		} else if task.Job == REDUCE {
-			reduceTaskHandler()
+			reduceTaskHandler(reducef, task)
 		}
 
 	}
@@ -52,22 +52,37 @@ func mapTaskHandler(mapf func(string, string) []KeyValue, task *GetTaskReply) {
 	fileName := task.FileName
 	contents, err := os.ReadFile(fileName)
 	if err != nil {
-		log.Fatalf("Failed to read file: %v", fileName)
-		panic(err)
+		log.Printf("Failed to read file: %v, error: %v", fileName, err)
+		return
 	}
 
 	kva := mapf(fileName, string(contents))
 
-	writeIntermediatefiles(kva, task.Index, task.ReduceCount)
+	err = writeIntermediatefiles(kva, task.Index, task.ReduceCount)
+	if err != nil {
+		log.Printf("Error completing writeIntermediateFiles on task[%v], error: %v", task.Index, err)
+		return
+	}
 
+	maxRetries := 5
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if ok := MarkTaskComplete(task); ok {
+			log.Printf("Task %v marked complete.", task.Index)
+			return
+		}
+		log.Printf("Retrying MarkTaskComplete RPC request for task[%v] of job[%v]. Attempt: %v", task.Index, task.Job, attempt)
+		time.Sleep(500 * time.Millisecond)
+	}
+	log.Printf("Unable to reach coordinator and mark task [%v] completed. Tried %v times.", task.Index, maxRetries)
 }
 
 // Function to write intermediate temp files and rename once successful
-func writeIntermediatefiles(kva []KeyValue, mapTaskIndex int, reduceCount int) {
+func writeIntermediatefiles(kva []KeyValue, mapTaskIndex int, reduceCount int) error {
 
 	// pointers to intermediate files and encoders for each
 	encoders := make(map[int]*json.Encoder)
 	files := make(map[int]*os.File)
+	createdFiles := []string{}
 
 	for _, kv := range kva {
 		reducer := ihash(kv.Key) % reduceCount
@@ -76,15 +91,18 @@ func writeIntermediatefiles(kva []KeyValue, mapTaskIndex int, reduceCount int) {
 		if _, exists := files[reducer]; !exists {
 			file, err := os.Create(fileName)
 			if err != nil {
-				log.Fatalf("Error creating file: %v, error: %v", fileName, err)
+				return fmt.Errorf("Error creating file: %v, error: %v", fileName, err)
 			}
+			defer file.Close()
 			files[reducer] = file
 			encoders[reducer] = json.NewEncoder(file)
+			createdFiles = append(createdFiles, fileName)
 		}
 
 		err := encoders[reducer].Encode(&kv)
 		if err != nil {
-			log.Fatalf("Error encoding to file: %v, error: %v", fileName, err)
+			cleanUpTempFiles(createdFiles)
+			return fmt.Errorf("Error encoding to file: %v, error: %v", fileName, err)
 		}
 	}
 
@@ -97,12 +115,25 @@ func writeIntermediatefiles(kva []KeyValue, mapTaskIndex int, reduceCount int) {
 
 		err := os.Rename(tempName, finalName)
 		if err != nil {
-			log.Fatalf("Failed to rename: %v, Error: %v", tempName, err)
+			cleanUpTempFiles(createdFiles)
+			return fmt.Errorf("Failed to rename: %v, Error: %v", tempName, err)
 		}
+	}
+	return nil
+}
+
+// Function to cleanup created files on failure
+func cleanUpTempFiles(createdFiles []string) {
+	for _, file := range createdFiles {
+		os.Remove(file)
 	}
 }
 
-func reduceTaskHandler() {}
+func reduceTaskHandler(reducef func(string, []string) string, task *GetTaskReply) {
+	fileName := fmt.Sprintf("mr-%v-%v", task.)
+
+	// kva := mapf(fileName, string(contents))
+}
 
 // RPC call returning a valid task from the coordinator if available
 // If communication fails, assume job is completely done and send signal to exit
@@ -115,7 +146,23 @@ func GetTask() (*GetTaskReply, bool) {
 	} else {
 		return nil, false
 	}
+}
 
+// RPC call to mark a task complete
+func MarkTaskComplete(task *GetTaskReply) bool {
+	args := TaskCompleteArg{
+		Index: task.Index,
+		Job:   task.Job,
+	}
+	reply := TaskCompleteReply{}
+	ok := call("Coordinator.MarkTaskComplete", &args, &reply)
+	if ok {
+		fmt.Printf("Task: %v[%v] marked complete.", task.Job, task.Index)
+		return true
+	} else {
+		log.Printf("Error marking task %v of %v job complete, please try again.", task.Index, task.Job)
+		return false
+	}
 }
 
 // send an RPC request to the coordinator, wait for the response.

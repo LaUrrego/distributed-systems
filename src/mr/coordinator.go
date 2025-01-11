@@ -143,6 +143,51 @@ func (c *Coordinator) allTasksComplete(tasks []Task) bool {
 	return true
 }
 
+// Runs a ticker periodically for 10 seconds, afterwhich the coordinator will check whether
+// the job is done. If not, it will check for "crashed" workers for reassignment
+func (c *Coordinator) periodicChecker() {
+	ticker := time.NewTicker(10 * time.Second)
+
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				c.mu.Lock()
+				if c.Done() {
+					ticker.Stop()
+					c.mu.Unlock()
+					return
+				}
+				c.mu.Unlock()
+
+				c.checkAndReassign()
+			}
+
+		}
+	}()
+}
+
+// Function to reassign tasks that have exceeded the 10 second threshold
+// Since UNASSIGNED is our 0-value, all are automatically status UNASSIGNED
+func (c *Coordinator) checkAndReassign() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for i, mt := range c.MapTasks {
+		if mt.Status == ASSIGNED &&
+			time.Since(mt.Started) >= 10*time.Second {
+			c.MapTasks[i] = Task{}
+		}
+	}
+
+	for i, rt := range c.ReduceTasks {
+		if rt.Status == ASSIGNED &&
+			time.Since(rt.Started) >= 10*time.Second {
+			c.ReduceTasks[i] = Task{}
+		}
+	}
+}
+
 // start a thread that listens for RPCs from worker.go
 func (c *Coordinator) server() {
 	rpc.Register(c)
@@ -160,11 +205,10 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	ret := false
+	mapDone := c.allTasksComplete(c.MapTasks)
+	reduceDone := c.allTasksComplete(c.ReduceTasks)
 
-	// Your code here.
-
-	return ret
+	return mapDone && reduceDone
 }
 
 // create a Coordinator.
@@ -177,6 +221,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		ReduceTasks: make([]Task, nReduce),
 	}
 
+	c.periodicChecker()
 	c.server()
 	return &c
 }
