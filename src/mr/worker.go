@@ -34,46 +34,48 @@ func Worker(mapf func(string, string) []KeyValue,
 			break
 		}
 		if task.WaitForTask {
+			fmt.Print("Waiting for task...\n")
 			time.Sleep(5 * time.Second)
-			continue
-		}
-
-		if task.Job == MAP {
-			mapTaskHandler(mapf, task)
-		} else if task.Job == REDUCE {
-			reduceTaskHandler(reducef, task)
+		} else {
+			if task.Job == MAP {
+				mapTaskHandler(mapf, task)
+			} else if task.Job == REDUCE {
+				reduceTaskHandler(reducef, task)
+			}
 		}
 
 	}
 }
 
 func mapTaskHandler(mapf func(string, string) []KeyValue, task *GetTaskReply) {
+	fmt.Print("Starting mapTaskHandler\n")
 
 	fileName := task.FileName
+	fmt.Printf("Reading file: [%v]\n", fileName)
 	contents, err := os.ReadFile(fileName)
 	if err != nil {
-		log.Printf("Failed to read file: %v, error: %v", fileName, err)
-		return
+		fmt.Printf("Failed to read file: %v, error: %v\n", fileName, err)
+		panic(err)
 	}
 
 	kva := mapf(fileName, string(contents))
 
 	err = writeIntermediatefiles(kva, task.Index, task.ReduceCount)
 	if err != nil {
-		log.Printf("Error completing writeIntermediateFiles on task[%v], error: %v", task.Index, err)
+		fmt.Printf("Error completing writeIntermediateFiles on task[%v], error: %v\n", task.Index, err)
 		return
 	}
 
 	maxRetries := 5
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if ok := MarkTaskComplete(task); ok {
-			log.Printf("Task %v marked complete.", task.Index)
+			fmt.Printf("Task %v marked complete.\n", task.Index)
 			return
 		}
-		log.Printf("Retrying MarkTaskComplete RPC request for task[%v] of job[%v]. Attempt: %v", task.Index, task.Job, attempt)
+		fmt.Printf("Retrying MarkTaskComplete RPC request for task[%v] of job[%v]. Attempt: %v\n", task.Index, task.Job, attempt)
 		time.Sleep(500 * time.Millisecond)
 	}
-	log.Printf("Unable to reach coordinator and mark task [%v] completed. Tried %v times.", task.Index, maxRetries)
+	fmt.Printf("Unable to reach coordinator and mark task [%v] completed. Tried %v times.\n", task.Index, maxRetries)
 }
 
 // Function to write intermediate temp files and rename once successful
@@ -91,9 +93,8 @@ func writeIntermediatefiles(kva []KeyValue, mapTaskIndex int, reduceCount int) e
 		if _, exists := files[reducer]; !exists {
 			file, err := os.Create(fileName)
 			if err != nil {
-				return fmt.Errorf("Error creating file: %v, error: %v", fileName, err)
+				return fmt.Errorf("error creating file: %v, error: %v", fileName, err)
 			}
-			defer file.Close()
 			files[reducer] = file
 			encoders[reducer] = json.NewEncoder(file)
 			createdFiles = append(createdFiles, fileName)
@@ -102,21 +103,24 @@ func writeIntermediatefiles(kva []KeyValue, mapTaskIndex int, reduceCount int) e
 		err := encoders[reducer].Encode(&kv)
 		if err != nil {
 			cleanUpTempFiles(createdFiles)
-			return fmt.Errorf("Error encoding to file: %v, error: %v", fileName, err)
+			return fmt.Errorf("error encoding to file: %v, error: %v", fileName, err)
 		}
 	}
 
 	// atomically rename each file
 
 	for i, file := range files {
-		file.Close()
+		if err := file.Close(); err != nil {
+			cleanUpTempFiles(createdFiles)
+			return fmt.Errorf("failed to close file: [%v]", file)
+		}
 		finalName := fmt.Sprintf("mr-%v-%v", mapTaskIndex, i)
 		tempName := fmt.Sprintf("mr-%v-%v-tmp", mapTaskIndex, i)
 
 		err := os.Rename(tempName, finalName)
 		if err != nil {
 			cleanUpTempFiles(createdFiles)
-			return fmt.Errorf("Failed to rename: %v, Error: %v", tempName, err)
+			return fmt.Errorf("failed to rename: %v, Error: %v", tempName, err)
 		}
 	}
 	return nil
@@ -130,9 +134,10 @@ func cleanUpTempFiles(createdFiles []string) {
 }
 
 func reduceTaskHandler(reducef func(string, []string) string, task *GetTaskReply) {
-	fileName := fmt.Sprintf("mr-%v-%v", task.)
 
-	// kva := mapf(fileName, string(contents))
+	fmt.Printf("Arrived at reduce: Task[%v]\n", task.Index)
+	MarkTaskComplete(task)
+
 }
 
 // RPC call returning a valid task from the coordinator if available
@@ -157,10 +162,10 @@ func MarkTaskComplete(task *GetTaskReply) bool {
 	reply := TaskCompleteReply{}
 	ok := call("Coordinator.MarkTaskComplete", &args, &reply)
 	if ok {
-		fmt.Printf("Task: %v[%v] marked complete.", task.Job, task.Index)
+		fmt.Printf("Task: %v[%v] marked complete.\n", task.Job, task.Index)
 		return true
 	} else {
-		log.Printf("Error marking task %v of %v job complete, please try again.", task.Index, task.Job)
+		fmt.Printf("Error marking task %v of %v job complete, please try again.\n", task.Index, task.Job)
 		return false
 	}
 }

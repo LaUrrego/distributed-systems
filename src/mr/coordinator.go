@@ -1,6 +1,8 @@
 package mr
 
 import (
+	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -33,11 +35,15 @@ type Task struct {
 	Started time.Time
 }
 
+// Coordinator keeps track of a collection of input files, MapTasks, ReduceTasks, and
+// uses a Completed channel to signal the end of it's period worker health checks. Mutex
+// is used to keep the structure thread safe
 type Coordinator struct {
 	Files       []string
 	MapTasks    []Task
 	ReduceTasks []Task
 	mu          sync.Mutex
+	Completed   chan struct{}
 }
 
 //////////////////////////////////////////////////////////
@@ -64,6 +70,9 @@ type TaskCompleteArg struct {
 
 type TaskCompleteReply struct{}
 
+// Error return to signal job completion when a worker calls GetTask via RPC
+var ErrJobDone = errors.New("job completed successfully")
+
 // General task handler for Map and Reduce tasks
 func (c *Coordinator) GetTask(args *GetTaskArg, reply *GetTaskReply) error {
 	c.mu.Lock()
@@ -71,26 +80,31 @@ func (c *Coordinator) GetTask(args *GetTaskArg, reply *GetTaskReply) error {
 
 	// Map-phase
 	if i, task := c.findAvailableTask(c.MapTasks); i >= 0 {
+		fmt.Printf("Task to assign[MAP]: i:[%d] task:[%v], reply:[%v]\n", i, task, reply)
 		c.assignTask(i, task, reply, MAP)
 		return nil
 	}
 
 	if !c.allTasksComplete(c.MapTasks) {
 		reply.WaitForTask = true
+		fmt.Printf("Asked to wait[MAP], send reply: %v\n", reply)
 		return nil
 	}
 
 	// Reduce-phase
 	if i, task := c.findAvailableTask(c.ReduceTasks); i >= 0 {
+		fmt.Printf("Task to assign[REDUCE]: i:[%d] task:[%v], reply:[%v]\n", i, task, reply)
 		c.assignTask(i, task, reply, REDUCE)
 		return nil
 	}
 
 	// All reduce tasks completed means the whole MR job is done
 	if c.allTasksComplete(c.ReduceTasks) {
-		return nil
+		close(c.Completed)
+		return ErrJobDone
 	}
 
+	fmt.Printf("Asked to wait[REDUCE], send reply: %v\n", reply)
 	reply.WaitForTask = true
 	return nil
 }
@@ -143,8 +157,8 @@ func (c *Coordinator) allTasksComplete(tasks []Task) bool {
 	return true
 }
 
-// Runs a ticker periodically for 10 seconds, afterwhich the coordinator will check whether
-// the job is done. If not, it will check for "crashed" workers for reassignment
+// Checker for "crashed" workers using a 10 second interval. When the job is done, a close(c.Completed)
+// command triggers a ticker stop and ends the periodic check.
 func (c *Coordinator) periodicChecker() {
 	ticker := time.NewTicker(10 * time.Second)
 
@@ -152,15 +166,12 @@ func (c *Coordinator) periodicChecker() {
 		for {
 			select {
 			case <-ticker.C:
-				c.mu.Lock()
-				if c.Done() {
-					ticker.Stop()
-					c.mu.Unlock()
-					return
-				}
-				c.mu.Unlock()
-
 				c.checkAndReassign()
+
+			case <-c.Completed:
+				fmt.Printf("Received the completed signal!\n")
+				ticker.Stop()
+				return
 			}
 
 		}
@@ -173,12 +184,16 @@ func (c *Coordinator) checkAndReassign() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	fmt.Printf("Started checkAndReasign for [%v] map tasks\n", len(c.MapTasks))
+
 	for i, mt := range c.MapTasks {
 		if mt.Status == ASSIGNED &&
 			time.Since(mt.Started) >= 10*time.Second {
 			c.MapTasks[i] = Task{}
 		}
 	}
+
+	fmt.Printf("Started checkAndReasign for [%v] reduce tasks\n", len(c.ReduceTasks))
 
 	for i, rt := range c.ReduceTasks {
 		if rt.Status == ASSIGNED &&
@@ -200,6 +215,7 @@ func (c *Coordinator) server() {
 		log.Fatal("listen error:", e)
 	}
 	go http.Serve(l, nil)
+	fmt.Print("Server started...\n")
 }
 
 // main/mrcoordinator.go calls Done() periodically to find out
@@ -207,7 +223,9 @@ func (c *Coordinator) server() {
 func (c *Coordinator) Done() bool {
 	mapDone := c.allTasksComplete(c.MapTasks)
 	reduceDone := c.allTasksComplete(c.ReduceTasks)
-
+	if mapDone && reduceDone {
+		fmt.Print("MR Job is done!\n\n")
+	}
 	return mapDone && reduceDone
 }
 
@@ -219,7 +237,10 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		Files:       files,
 		MapTasks:    make([]Task, len(files)),
 		ReduceTasks: make([]Task, nReduce),
+		Completed:   make(chan struct{}),
 	}
+
+	fmt.Printf("Starting coordinator: files:[%v], No. Map Tasks [%v], No. Reduce Tasks [%v]\n\n", files, len(c.MapTasks), len(c.ReduceTasks))
 
 	c.periodicChecker()
 	c.server()
