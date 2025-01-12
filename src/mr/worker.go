@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
 	"time"
 )
 
@@ -15,6 +16,14 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
@@ -48,10 +57,10 @@ func Worker(mapf func(string, string) []KeyValue,
 }
 
 func mapTaskHandler(mapf func(string, string) []KeyValue, task *GetTaskReply) {
-	fmt.Print("Starting mapTaskHandler\n")
+	//fmt.Print("Starting mapTaskHandler\n")
 
 	fileName := task.FileName
-	fmt.Printf("Reading file: [%v]\n", fileName)
+	//fmt.Printf("Reading file: [%v]\n", fileName)
 	contents, err := os.ReadFile(fileName)
 	if err != nil {
 		fmt.Printf("Failed to read file: %v, error: %v\n", fileName, err)
@@ -69,7 +78,7 @@ func mapTaskHandler(mapf func(string, string) []KeyValue, task *GetTaskReply) {
 	maxRetries := 5
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if ok := MarkTaskComplete(task); ok {
-			fmt.Printf("Task %v marked complete.\n", task.Index)
+			//fmt.Printf("Task %v marked complete.\n", task.Index)
 			return
 		}
 		fmt.Printf("Retrying MarkTaskComplete RPC request for task[%v] of job[%v]. Attempt: %v\n", task.Index, task.Job, attempt)
@@ -135,8 +144,72 @@ func cleanUpTempFiles(createdFiles []string) {
 
 func reduceTaskHandler(reducef func(string, []string) string, task *GetTaskReply) {
 
-	fmt.Printf("Arrived at reduce: Task[%v]\n", task.Index)
-	MarkTaskComplete(task)
+	//fmt.Printf("Arrived at Reduce Handler: Task[%v]\n", task.Index)
+
+	kvs, intermediateFiles := reduceIntermediateFileReader(task.Index, task.MapCount)
+	sort.Sort(ByKey(kvs))
+
+	outputFile := fmt.Sprintf("mr-out-%d", task.Index)
+	outFile, _ := os.Create(outputFile)
+
+	for i := 0; i < len(kvs); {
+		j := i + 1
+		for j < len(kvs) && kvs[j].Key == kvs[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, kvs[k].Value)
+		}
+		output := reducef(kvs[i].Key, values)
+		fmt.Fprintf(outFile, "%v %v\n", kvs[i].Key, output)
+
+		i = j
+	}
+
+	outFile.Close()
+
+	// Cleanup intermediate files
+	//fmt.Print("Cleaning up intermediate files...\n")
+	cleanUpTempFiles(intermediateFiles)
+
+	// Mark task complete once done, handle RPC communication failure
+	maxRetries := 5
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if ok := MarkTaskComplete(task); ok {
+			//fmt.Printf("Task %v marked complete.\n", task.Index)
+			return
+		}
+		//fmt.Printf("Retrying MarkTaskComplete RPC request for task[%v] of job[%v]. Attempt: %v\n", task.Index, task.Job, attempt)
+		time.Sleep(500 * time.Millisecond)
+	}
+	fmt.Printf("Unable to reach coordinator and mark task [%v] completed. Tried %v times.\n", task.Index, maxRetries)
+
+}
+
+func reduceIntermediateFileReader(reducerNum int, mapTaskCount int) ([]KeyValue, []string) {
+	kva := []KeyValue{}
+	intermediateFiles := []string{}
+
+	for mapTask := 0; mapTask < mapTaskCount; mapTask++ {
+		fileName := fmt.Sprintf("mr-%d-%d", mapTask, reducerNum)
+		file, err := os.Open(fileName)
+		if err != nil {
+			continue
+		}
+		defer file.Close()
+		intermediateFiles = append(intermediateFiles, fileName)
+
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			kva = append(kva, kv)
+		}
+	}
+	return kva, intermediateFiles
 
 }
 
@@ -162,7 +235,7 @@ func MarkTaskComplete(task *GetTaskReply) bool {
 	reply := TaskCompleteReply{}
 	ok := call("Coordinator.MarkTaskComplete", &args, &reply)
 	if ok {
-		fmt.Printf("Task: %v[%v] marked complete.\n", task.Job, task.Index)
+		//fmt.Printf("Task: %v[%v] marked complete.\n", task.Job, task.Index)
 		return true
 	} else {
 		fmt.Printf("Error marking task %v of %v job complete, please try again.\n", task.Index, task.Job)
